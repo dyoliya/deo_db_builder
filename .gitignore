@@ -1,0 +1,9 @@
+__pycache__/
+.vscode/
+*.xlsx
+*.db
+*.csv
+config/
+*.json
+venv/
+cache/
