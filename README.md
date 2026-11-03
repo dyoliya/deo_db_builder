@@ -79,6 +79,15 @@ DEO DB Builder addresses this by enforcing a controlled ETL pipeline:
 
 > Install all pinned dependencies from `requirements.txt`.
 
+## ⚠️ Manual Pre-requisites (Current Process)
+
+As of this initial version, there is **no automated fetch** for Pipedrive deals or BUDB data — the app only reads whatever is already sitting on disk. Before running `app.py` to build or update a DEO database, the following must be prepared manually each time fresh data is needed:
+
+1. **Export all Pipedrive deals** and save/rename the file as `cache/pipedrive_local_cache.csv` (required columns listed under **Requirements** above). There is no in-app button or background job that pulls this from Pipedrive's API — it is a manual export step every time you want up-to-date deal matching.
+2. **Place the current BUDB `.db` file** in `budb/` (exactly one file expected). The app does not generate, download, or refresh this file on its own.
+3. **(Google Sheets import only)** Confirm `config/google_service_account.json` exists and the target Google Sheet is shared with that service account's email.
+
+
 ## 🚀 Installation and Setup
 1. **Clone repository**
     ```bash
