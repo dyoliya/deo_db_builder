@@ -43,7 +43,7 @@ DEO DB Builder addresses this by enforcing a controlled ETL pipeline:
 - **Google Sheets writeback**: after a successful import, writes deal IDs, serial numbers, and upload dates back to the source sheet, with a pending/completed record so an interrupted writeback can be recovered instead of silently lost.
 - **Audit & reporting output**: NULL-conversion audit, deal-match audit, and a DEO-associated-deals report are generated automatically after each import.
 - **Operator-friendly desktop UI** with file/sheet selection, progress bar, and a live activity log.
-
+- **Change log between daily DB versions** (`deo_action_log.py`, run separately from `app.py`): diffs an "old" and a "new" DB snapshot and records every schema change, added row, deleted row, and modified field into a persistent `deo_action_log` table, carrying that history forward into each new DB version.
 ---
 
 ## 🧠 Logic Flow
@@ -66,6 +66,20 @@ DEO DB Builder addresses this by enforcing a controlled ETL pipeline:
    - `audit/` — NULL-conversion audit (only if suspicious conversions were found).
    - `existing_deals/` — deal-match audit and the DEO-associated-deals report.
 
+### Change-log flow (`deo_action_log.py`)
+This is a **separate, manually-run script** — it is not launched by `app.py` and does not run automatically as part of an import.
+
+1. After `app.py` finishes updating `database/<today>-deo.db`, manually copy that new daily DB into `new/`, and copy the previous version you're comparing against into `old/` (each folder must contain exactly one `.db` file).
+2. Run `python deo_action_log.py`.
+3. The script:
+   - Reads the date from the `new/` DB's filename (expects a `YYYY-MM-DD` pattern, e.g. `2026-03-12-deo.db`).
+   - Creates the `deo_action_log` table inside the **new** DB if it doesn't already exist.
+   - If the new DB's log table is still empty, copies forward all historical log rows from the old DB's log table first — this is what carries the full change history along as you roll from one daily DB to the next.
+   - Auto-detects the shared data table between old and new (e.g. `deo`) and compares them by `deo_id`:
+     - Logs any columns added or removed between the two schemas.
+     - Logs any `deo_id` present only in the new DB as `added`, and any present only in the old DB as `deleted` (full row snapshot as JSON).
+     - For rows present in both, logs each changed field individually as `modified` (old value → new value). `date_uploaded` is intentionally excluded from field comparison since it changes on every sync.
+4. The resulting `deo_action_log` table — now living inside the new DB file — becomes the historical record going forward; that same file is what you'd place in `old/` the next time you run this comparison.
 ---
 
 ## 📝 Requirements
@@ -123,7 +137,9 @@ As of this initial version, there is **no automated fetch** for Pipedrive deals 
     ├── audit/                          NULL-conversion audit exports (auto-created)
     ├── existing_deals/                 Deal-match audit + associated-deals reports (auto-created)
     ├── google_sheet_writeback/         Pending/completed Google writeback records (auto-created)
-    └── input/                          Local input files (optional, for manual drops)
+    ├── input/                          Local input files (optional, for manual drops)
+    ├── old/                            Manually placed: previous DB snapshot, for deo_action_log.py
+    └── new/                            Manually placed: latest DB snapshot, for deo_action_log.py
     </pre>
 
     Everything under `config/`, `budb/`, `cache/`, `database/`, `audit/`, `existing_deals/`, `google_sheet_writeback/`, and `input/` is environment-specific data and is excluded from version control via `.gitignore`.
@@ -165,18 +181,37 @@ As of this initial version, there is **no automated fetch** for Pipedrive deals 
 - Check `existing_deals/` for the deal-match audit and the DEO-associated-deals report generated after every import.
 - For Google Sheets imports, check the Activity Log for the writeback confirmation and record path under `google_sheet_writeback/`.
 
-### D. Important usage notes
+### D. Update the change log (`deo_action_log.py`)
+Run this after an import whenever you want the historical change log updated for that new DB version:
+1. After `app.py` finishes and `database/<today>-deo.db` is updated, copy that file into `new/`.
+2. Copy the previous version you're comparing against (e.g. yesterday's DB, or whatever DB currently holds the existing `deo_action_log` history) into `old/`.
+   - Only one `.db` file should be in each of `old/` and `new/` at a time — clear out the previous run's files first.
+3. Run:
+   ```bash
+   python deo_action_log.py
+   ```
+4. The script logs schema changes, added rows, deleted rows, and modified fields into the `deo_action_log` table inside the **new** DB, and carries forward the old DB's log history automatically if the new DB doesn't have any yet.
+5. **Review the logged entries** in the `deo_action_log` table of the DB in `new/` — check that the added/deleted/modified rows make sense for that version.
+   - **If everything looks correct**: replace the DB in `database/` with the reviewed `.db` from `new/` — this makes it the official daily version.
+   - **If something looks wrong**: coordinate with **Jennifer Cariño** on the flagged log entries to correct the input (Google Sheets) data, then:
+     1. Revert `database/` by moving the previous good DB back from `database/previous_versions/` into `database/`.
+     2. Re-run the import in `app.py` against the corrected input to rebuild a new version of the database.
+     3. Repeat the change-log comparison (steps 1–5) against this rebuilt version before replacing `database/` again.
+
+### E. Important usage notes
 - Each calendar day gets its own database file; re-running on the same day continues syncing into that day's file rather than creating a new one.
 - If a Google Sheets writeback is interrupted, a pending record remains in `google_sheet_writeback/` and must be resolved before the next Google Sheets import can run.
 - Incoming files with columns the database doesn't recognize will be rejected with a schema-mismatch error; missing (already-known) columns are allowed.
-- `deo_action_log.py` is a separate, standalone script (not launched from `app.py`) for diffing two DB snapshots placed in `old/` and `new/` — run it manually when a historical change log is needed.
+- `deo_action_log.py` is a separate, standalone script (not launched from `app.py`) — see **D** above for the manual steps.
 
-### E. Common troubleshooting
+### F. Common troubleshooting
 - **"Pipedrive local cache CSV not found"**: Ensure `cache/pipedrive_local_cache.csv` exists with the required columns.
 - **"BUDB folder not found" / "No .db file found in BUDB folder"**: Place exactly one BUDB `.db` file in `budb/`.
 - **"A previous Google writeback needs recovery"**: Resolve the pending file in `google_sheet_writeback/` before starting another Google Sheets import.
 - **"The Google Sheet changed while downloading"**: Re-run the import after editing of the sheet has stopped.
 - **Schema mismatch errors**: Compare the incoming file's columns against the existing database schema reported in the error message.
+- **"No .db file found in folder" / "Expected only 1 .db file in folder"** (from `deo_action_log.py`): Make sure `old/` and `new/` each contain exactly one `.db` file before running the script.
+- **"No common user table found between old and new databases"**: The two DBs don't share a data table with the same name — confirm you placed the correct snapshots in `old/` and `new/`.
 
 ---
 
