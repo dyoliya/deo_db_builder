@@ -4,6 +4,7 @@ import json
 import sqlite3
 from glob import glob
 from typing import List, Dict, Any, Optional
+from pathlib import Path
 
 # ============================================================
 # CONFIG
@@ -13,7 +14,7 @@ NEW_DIR = "new"
 
 # Set to None to auto-detect one common table between old/new DBs.
 # Or set explicitly, e.g. TABLE_NAME = "deo"
-TABLE_NAME = None
+TABLE_NAME = "deo"
 
 PRIMARY_KEY = "deo_id"
 IGNORE_FIELDS = {"date_uploaded"}
@@ -169,7 +170,6 @@ def create_log_table_if_needed(conn: sqlite3.Connection) -> None:
             modified_date TEXT
         )
     """)
-    conn.commit()
 
 
 def get_log_table_row_count(conn: sqlite3.Connection) -> int:
@@ -228,7 +228,6 @@ def copy_old_logs_to_new_if_needed(old_conn: sqlite3.Connection, new_conn: sqlit
         )
         for row in rows
     ])
-    new_conn.commit()
     return len(rows)
 
 
@@ -259,9 +258,31 @@ def insert_log(
 # ============================================================
 # MAIN COMPARISON
 # ============================================================
-def compare_databases():
-    old_db_path = find_single_db(OLD_DIR)
-    new_db_path = find_single_db(NEW_DIR)
+def compare_databases(
+    old_db_path=None,
+    new_db_path=None,
+    build_id=None,
+):
+    # Preserve the optional standalone behavior.
+    if new_db_path is None:
+        old_db_path = find_single_db(OLD_DIR)
+        new_db_path = find_single_db(NEW_DIR)
+
+    new_db_path = str(Path(new_db_path).resolve())
+
+    if not Path(new_db_path).is_file():
+        raise FileNotFoundError(new_db_path)
+
+    if old_db_path is not None:
+        old_db_path = str(Path(old_db_path).resolve())
+
+        if not Path(old_db_path).is_file():
+            raise FileNotFoundError(old_db_path)
+
+        if old_db_path == new_db_path:
+            raise ValueError(
+                "Old and new databases must be different files."
+            )
 
     comparison_date = extract_date_from_filename(new_db_path)
     if comparison_date is None:
@@ -275,20 +296,56 @@ def compare_databases():
     print(f"Comparison date (from new DB filename): {comparison_date}")
     print(f"Log table will be stored inside the NEW DB: {LOG_TABLE_NAME}")
 
-    old_conn = connect_db(old_db_path)
-    new_conn = connect_db(new_db_path)
+    old_conn = None
+    new_conn = None
 
     try:
+        if old_db_path:
+            old_conn = sqlite3.connect(
+                Path(old_db_path).as_uri() + "?mode=ro",
+                uri=True,
+            )
+            old_conn.row_factory = sqlite3.Row
+
+        new_conn = connect_db(new_db_path)
+        new_conn.execute("BEGIN IMMEDIATE")
+
+        new_conn.execute("""
+            CREATE TABLE IF NOT EXISTS deo_action_log_runs (
+                build_id TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        if build_id and new_conn.execute(
+            "SELECT 1 FROM deo_action_log_runs WHERE build_id = ?",
+            (build_id,),
+        ).fetchone():
+            new_conn.rollback()
+            print(
+                "Action log already completed for this build; "
+                "nothing added."
+            )
+            return
         create_log_table_if_needed(new_conn)
 
-        copied_history_count = copy_old_logs_to_new_if_needed(old_conn, new_conn)
+        copied_history_count = (
+            copy_old_logs_to_new_if_needed(old_conn, new_conn)
+            if old_conn
+            else 0
+        )
         print(f"Copied prior log rows from OLD DB: {copied_history_count}")
 
-        table_name = resolve_table_name(old_conn, new_conn)
+        table_name = "deo"
         print(f"Using table: {table_name}")
 
-        old_columns = get_table_columns(old_conn, table_name)
         new_columns = get_table_columns(new_conn, table_name)
+
+        old_columns = (
+            get_table_columns(old_conn, table_name)
+            if old_conn
+            else new_columns
+        )
 
         if PRIMARY_KEY not in old_columns:
             raise ValueError(f"'{PRIMARY_KEY}' not found in OLD table '{table_name}'")
@@ -303,7 +360,11 @@ def compare_databases():
 
         comparable_columns = sorted((old_col_set & new_col_set) - IGNORE_FIELDS)
 
-        old_rows = fetch_rows_by_pk(old_conn, table_name, PRIMARY_KEY)
+        old_rows = (
+            fetch_rows_by_pk(old_conn, table_name, PRIMARY_KEY)
+            if old_conn
+            else {}
+        )
         new_rows = fetch_rows_by_pk(new_conn, table_name, PRIMARY_KEY)
 
         old_ids = set(old_rows.keys())
@@ -393,6 +454,12 @@ def compare_databases():
                     )
                     modified_count += 1
 
+        if build_id:
+            new_conn.execute(
+                "INSERT INTO deo_action_log_runs (build_id) VALUES (?)",
+                (build_id,),
+            )
+
         new_conn.commit()
 
         print("\nDone.")
@@ -403,9 +470,17 @@ def compare_databases():
         print(f"Modified fields logged : {modified_count}")
         print(f"Total new log entries  : {schema_count + added_count + deleted_count + modified_count}")
 
+    except Exception:
+        if new_conn is not None:
+            new_conn.rollback()
+        raise
+
     finally:
-        old_conn.close()
-        new_conn.close()
+        if old_conn is not None:
+            old_conn.close()
+
+        if new_conn is not None:
+            new_conn.close()
 
 
 if __name__ == "__main__":

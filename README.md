@@ -88,18 +88,18 @@ This is a **separate, manually-run script** — it is not launched by `app.py` a
   - Google Cloud service account with Sheets (read/write) and Drive (read-only) scopes — required only for the Google Sheets import mode.
 - **Local reference data** (not included in the repo — must be supplied per environment):
   - A BUDB SQLite database placed in `budb/`, containing at minimum: `id`, `contact_group_id`, `Owner`, `Owner (Standardized)`, `Input: Address`, `Input: City`, `Input: State`, `md_address`, `md_city`, `md_state`.
-  - A Pipedrive export CSV placed at `cache/pipedrive_local_cache.csv`, containing at minimum: `Deal - ID`, `Deal - Title`, `Deal - Contact person`, `Person - Mailing Address`, `Deal - Serial Number`.
+  - A Pipedrive deals source at `cache/pipedrive_local_cache.csv`, containing at minimum: `Deal - ID`, `Deal - Title`, `Deal - Contact person`, `Person - Mailing Address`, `Deal - Serial Number`. This is normally downloaded automatically via the Pipedrive API (see below) — manual export is only needed as a fallback.
 - **Python packages**: see `requirements.txt` (UI: `customtkinter`; data: `pandas`, `openpyxl`; Google auth: `google-auth`; HTTP: `requests`).
 
 > Install all pinned dependencies from `requirements.txt`.
 
 ## ⚠️ Manual Pre-requisites (Current Process)
 
-As of this initial version, there is **no automated fetch** for Pipedrive deals or BUDB data — the app only reads whatever is already sitting on disk. Before running `app.py` to build or update a DEO database, the following must be prepared manually each time fresh data is needed:
+Pipedrive deals are fetched automatically via the Pipedrive API once a token is entered in the app's **Pipedrive** tab (see **4.3** below) — there's no separate export/rename step needed for this in normal use. The following still require manual setup:
 
-1. **Export all Pipedrive deals** and save/rename the file as `cache/pipedrive_local_cache.csv` (required columns listed under **Requirements** above). There is no in-app button or background job that pulls this from Pipedrive's API — it is a manual export step every time you want up-to-date deal matching.
-2. **Place the current BUDB `.db` file** in `budb/` (exactly one file expected). The app does not generate, download, or refresh this file on its own.
-3. **(Google Sheets import only)** Confirm `config/google_service_account.json` exists and the target Google Sheet is shared with that service account's email.
+1. **Place the current BUDB `.db` file** in `budb/` (exactly one file expected). The app does not generate, download, or refresh this file on its own.
+2. **(Google Sheets import only)** Confirm `config/google_service_account.json` exists and the target Google Sheet is shared with that service account's email.
+3. **(Fallback only)** If "Use Pipedrive API" is turned off in the Pipedrive tab, Pipedrive deals go back to the old manual process: export all Pipedrive deals and save/rename the file as `cache/pipedrive_local_cache.csv` (required columns listed under **Requirements** above) every time fresh data is needed.
 
 
 ## 🚀 Installation and Setup
@@ -123,15 +123,17 @@ As of this initial version, there is **no automated fetch** for Pipedrive deals 
     ├── deo_sqlite.py                    SQLite schema + row sync helpers
     ├── deo_deal_id_matcher.py           Row-level Pipedrive deal ID matching
     ├── pipedrive_lookup.py              Pipedrive cache loading + lookup maps
+    ├── pipedrive_api.py                 Pipedrive API client + deals download/cache refresh
     ├── deo_budb.py                      Row-level BUDB ID matching + cache
     ├── deo_existing_deals_report.py     Associated-deals report generation
     ├── deo_action_log.py                Standalone utility: diffs old/ vs new/ DB snapshots into an action log
     ├── requirements.txt
     ├── version.txt
-    ├── config/                         Google service account credentials (local only)
-    │   └── google_service_account.json
+    ├── config/                         Google service account + Pipedrive settings (local only)
+    │   ├── google_service_account.json
+    │   └── pipedrive_settings.json
     ├── budb/                           BUDB reference database (local only)
-    ├── cache/                          Local lookup caches + Pipedrive export CSV (local only)
+    ├── cache/                          Local lookup caches + Pipedrive deals CSV (local only)
     ├── database/                       Daily DEO databases (auto-created)
     │   └── previous_versions/          Archived daily databases
     ├── audit/                          NULL-conversion audit exports (auto-created)
@@ -155,9 +157,11 @@ As of this initial version, there is **no automated fetch** for Pipedrive deals 
     4.2. **BUDB Reference Database**
     - Place exactly one `.db` file inside `budb/`. The app expects exactly one file there and will raise an error if none or more than one is found.
 
-    4.3. **Pipedrive Local Cache**
-    - Export deals from Pipedrive and save the file as `cache/pipedrive_local_cache.csv`, with the required columns listed under **Requirements** above.
-    - The app rebuilds its internal lookup cache automatically whenever this CSV changes.
+    4.3. **Pipedrive Deals (API download)**
+    - Open the app's **Pipedrive** tab, check **Use Pipedrive API**, and paste in a Pipedrive API token (use the **Open API token page** button to find it in Pipedrive under Settings → API). The token is saved to `config/pipedrive_settings.json` so it only needs to be entered once.
+    - Click **Download Deals Now** to fetch deals immediately, or just start an import — the app automatically downloads fresh deals before matching if the cache is missing or older than `cache_window_hours` (default 8 hours, set in `config/pipedrive_settings.json`).
+    - Downloaded deals are written to `cache/pipedrive_local_cache.csv` in the same format as a manual export, so everything downstream (deal matching, the associated-deals report) works unchanged.
+    - Uncheck **Use Pipedrive API** (or leave the token blank) to fall back to the old manual process: export deals from Pipedrive yourself and save the file as `cache/pipedrive_local_cache.csv`, with the required columns listed under **Requirements** above.
 
 ## 🖥️ User Guide
 
@@ -165,7 +169,7 @@ As of this initial version, there is **no automated fetch** for Pipedrive deals 
 1. Open the project folder.
 2. Confirm `config/google_service_account.json` exists (if you'll use Google Sheets import).
 3. Confirm `budb/` contains exactly one BUDB `.db` file.
-4. Confirm `cache/pipedrive_local_cache.csv` exists and is reasonably up to date.
+4. In the **Pipedrive** tab, confirm **Use Pipedrive API** is checked and a token is entered (or, if using the manual fallback, confirm `cache/pipedrive_local_cache.csv` exists and is reasonably up to date).
 
 ### B. Import deceased-owner records
 1. Launch the app (`python app.py`, or the compiled executable).
@@ -205,7 +209,9 @@ Run this after an import whenever you want the historical change log updated for
 - `deo_action_log.py` is a separate, standalone script (not launched from `app.py`) — see **D** above for the manual steps.
 
 ### F. Common troubleshooting
-- **"Pipedrive local cache CSV not found"**: Ensure `cache/pipedrive_local_cache.csv` exists with the required columns.
+- **"Pipedrive local cache CSV not found"**: With the API off, ensure `cache/pipedrive_local_cache.csv` exists with the required columns. With the API on, click **Download Deals Now** in the Pipedrive tab.
+- **"Pipedrive API token is not set"**: Enter a token in the Pipedrive tab, or uncheck **Use Pipedrive API** to use a manually placed CSV instead.
+- **Pipedrive download errors (bad token, rate limited, field not found, etc.)**: The error message in the Activity Log / popup names the specific problem (e.g. an unexpected or renamed Pipedrive field) — check `config/pipedrive_settings.json`'s `deal_custom_field_labels` against the actual field names in Pipedrive if a field-not-found error appears.
 - **"BUDB folder not found" / "No .db file found in BUDB folder"**: Place exactly one BUDB `.db` file in `budb/`.
 - **"A previous Google writeback needs recovery"**: Resolve the pending file in `google_sheet_writeback/` before starting another Google Sheets import.
 - **"The Google Sheet changed while downloading"**: Re-run the import after editing of the sheet has stopped.

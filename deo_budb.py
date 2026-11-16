@@ -216,6 +216,46 @@ def deserialize_key(key_str: str) -> Tuple[str, str, str, str]:
 # BUDB FILE DISCOVERY
 # =========================================================
 
+def validate_budb_file(value: str | Path) -> Path:
+    if not str(value).strip():
+        raise ValueError("Select a Bottoms Up .db file first.")
+
+    path = Path(value).expanduser().resolve()
+
+    if path.suffix.lower() != ".db" or not path.is_file():
+        raise ValueError("Select an existing .db file.")
+
+    conn = sqlite3.connect(
+        path.as_uri() + "?mode=ro",
+        uri=True,
+    )
+
+    try:
+        columns = get_existing_columns(conn, "bottoms_up")
+
+        if not columns:
+            raise ValueError("This file has no bottoms_up table.")
+
+        validate_budb_columns(columns)
+
+        missing = {"County", "State"} - set(columns)
+        if missing:
+            raise ValueError(
+                "BUDB is missing columns: "
+                + ", ".join(sorted(missing))
+            )
+
+        if conn.execute(
+            "SELECT 1 FROM bottoms_up LIMIT 1"
+        ).fetchone() is None:
+            raise ValueError(
+                "The bottoms_up table contains no records."
+            )
+    finally:
+        conn.close()
+
+    return path
+
 def get_single_budb_path(base_dir: str | Path) -> Path:
     base_dir = Path(base_dir)
     budb_dir = base_dir / "budb"
@@ -243,7 +283,11 @@ def get_single_budb_path(base_dir: str | Path) -> Path:
 # =========================================================
 
 def connect_sqlite_readonly(db_path: str | Path) -> sqlite3.Connection:
-    return sqlite3.connect(str(db_path))
+    path = Path(db_path).resolve()
+    return sqlite3.connect(
+        path.as_uri() + "?mode=ro",
+        uri=True,
+    )
 
 
 def get_existing_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
@@ -455,8 +499,8 @@ def load_budb_dataframe(budb_path: str | Path) -> tuple[pd.DataFrame, str]:
 
         query = f"""
             SELECT
-                [id] AS budb_id,
-                [contact_group_id] AS contact_group_id,
+                CAST([id] AS TEXT) AS budb_id,
+                CAST([contact_group_id] AS TEXT) AS contact_group_id,
                 [Owner] AS owner,
                 [Owner (Standardized)] AS owner_standardized,
                 [Input: Address] AS input_address,
@@ -538,14 +582,14 @@ def build_lookup_maps_from_budb_df(budb_df: pd.DataFrame) -> dict:
         "group_to_ids": group_to_ids,
     }
 
-def load_budb_lookup_maps(base_dir: str | Path):
+def load_budb_lookup_maps(base_dir: str | Path, budb_path: str | Path,):
     """
     Safe cache strategy:
     - if BUDB file path + mtime + size are unchanged, load lookup maps from cache
     - otherwise rebuild lookup maps from BUDB and refresh cache
     """
     base_dir = Path(base_dir)
-    budb_path = get_single_budb_path(base_dir)
+    budb_path = validate_budb_file(budb_path)
     budb_signature = get_budb_file_signature(budb_path)
 
     cache_path = get_cache_path(base_dir)
@@ -656,15 +700,103 @@ def match_budb_ids_for_deo_row(row, lookup_maps: dict) -> Optional[str]:
     return " | ".join(sorted(expanded_matches, key=sort_key))
 
 
-def populate_budb_ids_in_df(df: pd.DataFrame, lookup_maps: dict, progress_callback=None) -> pd.DataFrame:
+def populate_budb_ids_in_df(
+    df: pd.DataFrame,
+    lookup_maps: dict,
+    progress_callback=None,
+):
     df = df.copy()
     total = len(df)
-    budb_ids = []
 
-    for idx, row in enumerate(df.itertuples(index=False), start=1):
-        budb_ids.append(match_budb_ids_for_deo_row(row, lookup_maps))
+    budb_values = []
+    group_values = []
+    audit_records = []
+
+    id_to_group = lookup_maps.get("id_to_group", {})
+
+    for position, row in enumerate(df.itertuples(index=False)):
+        # Keep the existing matching and group-expansion logic.
+        original = match_budb_ids_for_deo_row(row, lookup_maps)
+        original_ids = original.split(" | ") if original else []
+
+        groups = {}
+        null_ids = []
+
+        for budb_id in original_ids:
+            raw_group = id_to_group.get(budb_id)
+
+            if raw_group is None or pd.isna(raw_group):
+                null_ids.append(budb_id)
+                continue
+
+            value = str(raw_group).strip()
+
+            if not value or value.lower() in {"nan", "none", "null"}:
+                null_ids.append(budb_id)
+                continue
+
+            # Accept integer IDs, including older values like "841038.0".
+            if not re.fullmatch(r"[0-9]+(?:\.0+)?", value):
+                raise ValueError(
+                    f"Invalid BUDB contact_group_id {value!r} "
+                    f"for ID {budb_id}."
+                )
+
+            group = int(value.split(".")[0])
+            groups.setdefault(group, []).append(budb_id)
+
+        selected = min(groups) if groups else None
+
+        retained = (
+            groups[selected]
+            if selected is not None
+            else original_ids
+        )
+
+        final_ids = " | ".join(retained) if retained else None
+        final_group = str(selected) if selected is not None else None
+
+        budb_values.append(final_ids)
+        group_values.append(final_group)
+
+        # Report only rows with multiple distinct non-NULL groups.
+        if len(groups) > 1:
+            kept = set(retained)
+
+            audit_records.append({
+                "sheet_row": int(df.index[position]) + 2,
+                "deo_id": getattr(row, "deo_id", None),
+                "original_budb_id": original,
+                "original_contact_group_ids": " | ".join(
+                    str(group) for group in sorted(groups)
+                ),
+                "contact_group_count": len(groups),
+                "budb_ids_by_group": "; ".join(
+                    f"{group}: {' | '.join(groups[group])}"
+                    for group in sorted(groups)
+                ),
+                "budb_ids_without_group": " | ".join(null_ids),
+                "selected_contact_group_id": final_group,
+                "final_budb_id": final_ids,
+                "removed_budb_id": " | ".join(
+                    item for item in original_ids if item not in kept
+                ),
+            })
+
         if progress_callback and total:
-            progress_callback(idx / total)
+            progress_callback((position + 1) / total)
 
-    df["budb_id"] = budb_ids
-    return df
+    df["budb_id"] = pd.Series(
+        budb_values,
+        index=df.index,
+        dtype=object,
+    )
+
+    # Always overwrite the incoming Google Sheet value.
+    df["contact_group_id"] = pd.Series(
+        group_values,
+        index=df.index,
+        dtype=object,
+    )
+
+    return df, pd.DataFrame(audit_records)

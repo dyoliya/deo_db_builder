@@ -1,9 +1,10 @@
 # deo_existing_deals_report.py
 
-import json
 import sqlite3
 from pathlib import Path
 import pandas as pd
+
+from pipedrive_api import load_settings
 
 
 PIPEDRIVE_LOCAL_CACHE_FILENAME = "pipedrive_local_cache.csv"
@@ -22,10 +23,7 @@ def split_deal_ids(value):
 
 
 def _load_pipedrive_base_url(base_dir: Path) -> str:
-    config_path = Path(base_dir) / "config" / "pipedrive_settings.json"
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    return config["base_url"]
+    return load_settings(base_dir)["base_url"]
 
 
 def generate_deo_associated_deals_report(db_path, base_dir, table="deo"):
